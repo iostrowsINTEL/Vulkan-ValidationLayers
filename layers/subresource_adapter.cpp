@@ -327,6 +327,91 @@ RangeGenerator& RangeGenerator::operator++() {
     return *this;
 }
 
+static bool IsValid(const BlitRangeEncoder& encoder, const VkImageSubresourceRange& bounds, const VkOffset3D& offset) {
+    const auto& limits = encoder.Limits();
+    return (((bounds.aspectMask & limits.aspectMask) == bounds.aspectMask) &&
+            (bounds.baseMipLevel + bounds.levelCount <= limits.mipLevel) &&
+            (bounds.baseArrayLayer + bounds.layerCount <= limits.arrayLayer) && (offset.x <= limits.offset.x) &&
+            (offset.y <= limits.offset.y) && (offset.z <= limits.offset.z));
+}
+
+BlitRangeGenerator::BlitRangeGenerator(const BlitRangeEncoder& encoder, const VkImageSubresourceRange& subres_range,
+                                       const VkOffset3D& offset)
+    : encoder_(&encoder), isr_pos_(encoder, subres_range, offset), pos_(), base_() {
+    assert(IsValid(encoder, isr_pos_.Limits()));
+
+    // To see if we have a full range special case, need to compare the subres_range against the *encoders* limits
+    const auto& limits = encoder.Limits();
+    if ((subres_range.baseArrayLayer == 0 && subres_range.layerCount == limits.arrayLayer)) {
+        if ((subres_range.baseMipLevel == 0) && (subres_range.levelCount == limits.mipLevel)) {
+            if (subres_range.aspectMask == limits.aspectMask) {
+                // Full range
+                pos_.begin = 0;
+                pos_.end = encoder.AspectSize() * limits.aspect_index;
+                aspect_count_ = 1;  // Flag this to never advance aspects.
+            } else {
+                // All mips all layers but not all aspect
+                pos_.begin = encoder.AspectBase(isr_pos_.aspect_index);
+                pos_.end = pos_.begin + encoder.AspectSize();
+                aspect_count_ = limits.aspect_index;
+            }
+        } else {
+            // All array layers, but not all levels
+            pos_.begin = encoder.AspectBase(isr_pos_.aspect_index) + subres_range.baseMipLevel * encoder.MipSize();
+            pos_.end = pos_.begin + subres_range.levelCount * encoder.MipSize();
+            aspect_count_ = limits.aspect_index;
+        }
+
+        // Full set of array layers at a time, thus we can span across all selected mip levels
+        mip_count_ = 1;  // we don't ever advance across mips, as we do all of then in one range
+    } else {
+        // Each range covers all included array_layers for each selected mip_level for each given selected aspect
+        // so we'll use the general purpose encode and smallest range size
+        pos_.begin = encoder.Encode(isr_pos_);
+        pos_.end = pos_.begin + subres_range.layerCount;
+
+        // we do have to traverse across mips, though (other than Encode abover), we don't have to know which one we are on.
+        mip_count_ = subres_range.levelCount;
+        aspect_count_ = limits.aspect_index;
+    }
+
+    // To get to the next aspect range we offset from the last base
+    base_ = pos_;
+    mip_index_ = 0;
+    aspect_index_ = isr_pos_.aspect_index;
+}
+
+RangeGenerator& RangeGenerator::operator++() {
+    mip_index_++;
+    // NOTE: If all selected mip levels are done at once, mip_count_ is set to one, not the number of selected mip_levels
+    if (mip_index_ >= mip_count_) {
+        const auto last_aspect_index = aspect_index_;
+        // Seek the next value aspect (if any)
+        aspect_index_ = encoder_->LowerBoundFromMask(isr_pos_.Limits().aspectMask, aspect_index_ + 1);
+        if (aspect_index_ < aspect_count_) {
+            // Force isr_pos to the beginning of this found aspect
+            isr_pos_.SeekAspect(aspect_index_);
+            // SubresourceGenerator should never be at tombstones we we aren't
+            assert(isr_pos_.aspectMask != 0);
+
+            // Offset by the distance between the last start of aspect and *this* start of aspect
+            aspect_base_ += (encoder_->AspectBase(isr_pos_.aspect_index) - encoder_->AspectBase(last_aspect_index));
+            pos_ = aspect_base_;
+            mip_index_ = 0;
+        } else {
+            // Tombstone both index range and subresource positions to "At end" convention
+            pos_ = {0, 0};
+            isr_pos_.aspectMask = 0;
+        }
+    } else {
+        // Note: for the layerCount < full_range.layerCount case, because the generated ranges per mip_level are discontinuous
+        // we have to do each individual array of ranges
+        pos_ += encoder_->MipSize();
+        isr_pos_.SeekMip(isr_pos_.Limits().baseMipLevel + mip_index_);
+    }
+    return *this;
+}
+
 template <typename AspectTraits>
 class AspectParametersImpl : public AspectParameters {
   public:
